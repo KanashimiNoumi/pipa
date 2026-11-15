@@ -13,6 +13,9 @@ import pandas as pd
 from backtesting import Backtest, Strategy
 
 BASE = Path(__file__).resolve().parents[1]
+# backtesting.py uses whole-number asset units. One engine unit represents
+# 0.001 units of the source asset so small simulated positions can be opened.
+PRICE_SCALE = 1000.0
 
 
 def ema(values, period: int):
@@ -261,6 +264,8 @@ def print_signal_analysis(summary: dict):
 def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     data = load_ohlcv(data_path)
+    engine_data = data.copy()
+    engine_data[["Open", "High", "Low", "Close"]] /= PRICE_SCALE
 
     position_fraction = float(config["position_fraction"])
     if not 0 < position_fraction < 1:
@@ -281,7 +286,7 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     )
 
     engine = Backtest(
-        data,
+        engine_data,
         strategy_type,
         cash=float(config["starting_balance"]),
         commission=float(config["fee_rate"]),
@@ -293,12 +298,21 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     reports_dir.mkdir(exist_ok=True)
     trades = stats["_trades"]
     trades_path = reports_dir / "backtest_trades.csv"
-    trades.to_csv(trades_path, index=False)
+    trade_report = trades.copy()
+    for column in ("EntryPrice", "ExitPrice", "SL", "TP"):
+        if column in trade_report.columns:
+            trade_report[column] *= PRICE_SCALE
+    if "Size" in trade_report.columns:
+        trade_report["Size"] /= PRICE_SCALE
+    trade_report.to_csv(trades_path, index=False)
 
     # Export crossover decisions and, where applicable, link them to the
     # simulated fill on the following bar. This is diagnostic only.
     signal_log = pd.DataFrame(stats["_strategy"].signal_log)
     if not signal_log.empty:
+        for column in ("SignalClose", "Signal_EMA_fast", "Signal_EMA_slow"):
+            if column in signal_log.columns:
+                signal_log[column] *= PRICE_SCALE
         signal_log["ExecutionTime"] = pd.Series(
             [pd.NaT] * len(signal_log), index=signal_log.index, dtype="datetime64[ns, UTC]"
         )
