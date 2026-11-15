@@ -35,6 +35,7 @@ class EmaRsiEducationalStrategy(Strategy):
     rsi_period = 14
     rsi_high = 65
     rsi_low = 35
+    position_fraction = 0.10
 
     def init(self):
         close = self.data.Close
@@ -46,7 +47,7 @@ class EmaRsiEducationalStrategy(Strategy):
         # Educational rule set only. Orders are simulated by the backtest engine.
         if self.fast[-1] > self.slow[-1] and self.momentum[-1] < self.rsi_high:
             if not self.position:
-                self.buy()
+                self.buy(size=self.position_fraction)
         elif self.fast[-1] < self.slow[-1] and self.momentum[-1] > self.rsi_low:
             if self.position:
                 self.position.close()
@@ -87,6 +88,10 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     data = load_ohlcv(data_path)
 
+    position_fraction = float(config["position_fraction"])
+    if not 0 < position_fraction < 1:
+        raise ValueError("position_fraction must be greater than 0 and less than 1.")
+
     # Set strategy parameters from the project's config file.
     strategy_type = type(
         "ConfiguredEducationalStrategy",
@@ -97,6 +102,7 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
             "rsi_period": int(config["rsi_period"]),
             "rsi_low": float(config["rsi_low"]),
             "rsi_high": float(config["rsi_high"]),
+            "position_fraction": float(config["position_fraction"]),
         },
     )
 
