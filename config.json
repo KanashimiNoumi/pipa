@@ -1,0 +1,10 @@
+{
+  "starting_balance": 10000.0,
+  "position_fraction": 0.1,
+  "fee_rate": 0.001,
+  "fast_ema": 12,
+  "slow_ema": 26,
+  "rsi_period": 14,
+  "rsi_low": 35,
+  "rsi_high": 65
+}
