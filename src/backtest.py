@@ -166,6 +166,74 @@ def calculate_trade_metrics(trades: pd.DataFrame) -> dict:
     }
 
 
+
+def analyze_signal_outcomes(data: pd.DataFrame, signals: pd.DataFrame):
+    """Measure what happened after each signal; descriptive, not predictive."""
+    if signals.empty:
+        return signals.copy(), {}
+
+    analyzed = signals.copy()
+    horizons = (3, 6, 12, 24)
+
+    for horizon in horizons:
+        future_closes, forward_returns, outcomes = [], [], []
+        for _, signal in analyzed.iterrows():
+            future_bar = int(signal["SignalBar"]) + horizon
+            if future_bar >= len(data):
+                future_closes.append(np.nan)
+                forward_returns.append(np.nan)
+                outcomes.append("INSUFFICIENT_FUTURE_DATA")
+                continue
+
+            future_close = float(data["Close"].iloc[future_bar])
+            signal_close = float(signal["SignalClose"])
+            change_pct = (future_close / signal_close - 1.0) * 100.0
+            future_closes.append(future_close)
+            forward_returns.append(change_pct)
+
+            if abs(change_pct) < 1e-9:
+                outcomes.append("FLAT")
+            elif signal["SignalType"] == "ENTRY":
+                outcomes.append("FAVORABLE" if change_pct > 0 else "UNFAVORABLE")
+            else:
+                outcomes.append("FAVORABLE_EXIT" if change_pct < 0 else "MISSED_UPSIDE")
+
+        analyzed[f"FutureClose_{horizon}h"] = future_closes
+        analyzed[f"ForwardReturnPct_{horizon}h"] = forward_returns
+        analyzed[f"Outcome_{horizon}h"] = outcomes
+
+    summary = {}
+    for horizon in horizons:
+        return_column = f"ForwardReturnPct_{horizon}h"
+        valid = analyzed[analyzed[return_column].notna()]
+        for signal_type in ("ENTRY", "EXIT"):
+            subset = valid[valid["SignalType"] == signal_type]
+            values = subset[return_column]
+            summary[f"{signal_type}_{horizon}h"] = {
+                "count": int(len(subset)),
+                "positive": int((values > 0).sum()),
+                "negative": int((values < 0).sum()),
+                "flat": int((values.abs() < 1e-9).sum()),
+            }
+    return analyzed, summary
+
+
+def print_signal_analysis(summary: dict):
+    print("\n=== SIGNAL FOLLOW-THROUGH (HISTORICAL) ===")
+    print("Forward price change from the signal candle close; counts are descriptive only.")
+    for horizon in (3, 6, 12, 24):
+        entry = summary.get(f"ENTRY_{horizon}h", {})
+        exit_ = summary.get(f"EXIT_{horizon}h", {})
+        print(
+            f"{horizon:>2}h | ENTRY: +{entry.get('positive', 0)} / "
+            f"-{entry.get('negative', 0)} / ={entry.get('flat', 0)} "
+            f"(n={entry.get('count', 0)}) | "
+            f"EXIT: +{exit_.get('positive', 0)} / "
+            f"-{exit_.get('negative', 0)} / ={exit_.get('flat', 0)} "
+            f"(n={exit_.get('count', 0)})"
+        )
+    print("For ENTRY, positive change is favorable; for EXIT, negative change is favorable.")
+
 def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     data = load_ohlcv(data_path)
@@ -238,6 +306,10 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     signals_path = reports_dir / "backtest_signals.csv"
     signal_log.to_csv(signals_path, index=False)
 
+    analyzed_signals, signal_summary = analyze_signal_outcomes(data, signal_log)
+    analysis_path = reports_dir / "signal_analysis.csv"
+    analyzed_signals.to_csv(analysis_path, index=False)
+
     trade_metrics = calculate_trade_metrics(trades)
 
     print("\n=== MARKET LAB: HISTORICAL BACKTEST ===")
@@ -261,6 +333,8 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     print(f"Maximum consecutive losses: {trade_metrics['max_consecutive_losses']}")
     print(f"Trade report: {trades_path}")
     print(f"Signal audit report: {signals_path}")
+    print(f"Signal outcome analysis: {analysis_path}")
+    print_signal_analysis(signal_summary)
     print("\nSimulation only. Historical results do not predict future outcomes.")
 
     if make_plot:
