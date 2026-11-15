@@ -42,17 +42,57 @@ class EmaRsiEducationalStrategy(Strategy):
         self.fast = self.I(ema, close, self.fast_ema, name="EMA fast")
         self.slow = self.I(ema, close, self.slow_ema, name="EMA slow")
         self.momentum = self.I(rsi, close, self.rsi_period, name="RSI")
+        # Separate educational audit log; it does not change trading decisions.
+        self.signal_log = []
 
     def next(self):
         # Detect a fresh crossover, not merely the current EMA ordering.
         crossed_up = self.fast[-2] <= self.slow[-2] and self.fast[-1] > self.slow[-1]
         crossed_down = self.fast[-2] >= self.slow[-2] and self.fast[-1] < self.slow[-1]
 
-        # RSI is an educational filter; all orders are simulated by the backtest engine.
-        if not self.position and crossed_up and self.momentum[-1] < self.rsi_high:
-            self.buy(size=self.position_fraction)
-        elif self.position and crossed_down and self.momentum[-1] > self.rsi_low:
-            self.position.close()
+        if not crossed_up and not crossed_down:
+            return
+
+        signal_type = "ENTRY" if crossed_up else "EXIT"
+        rsi_value = float(self.momentum[-1])
+        fast_value = float(self.fast[-1])
+        slow_value = float(self.slow[-1])
+        signal_bar = len(self.data) - 1
+        signal_time = self.data.index[-1]
+        signal_close = float(self.data.Close[-1])
+
+        if crossed_up:
+            filter_passed = rsi_value < self.rsi_high
+            if self.position:
+                decision = "IGNORED_ALREADY_IN_POSITION"
+            elif not filter_passed:
+                decision = "REJECTED_RSI_FILTER"
+            else:
+                decision = "SIMULATED_ENTRY"
+                self.buy(size=self.position_fraction)
+        else:
+            filter_passed = rsi_value > self.rsi_low
+            if not self.position:
+                decision = "IGNORED_NO_OPEN_POSITION"
+            elif not filter_passed:
+                decision = "REJECTED_RSI_FILTER"
+            else:
+                decision = "SIMULATED_EXIT"
+                self.position.close()
+
+        self.signal_log.append({
+            "SignalType": signal_type,
+            "SignalBar": signal_bar,
+            "SignalTime": signal_time,
+            "SignalClose": signal_close,
+            "Signal_EMA_fast": fast_value,
+            "Signal_EMA_slow": slow_value,
+            "Signal_RSI": rsi_value,
+            "RSI_Filter_Passed": filter_passed,
+            "Decision": decision,
+            # Market orders are simulated at the next bar's open by this engine.
+            "ExecutionBar": signal_bar + 1 if decision in ("SIMULATED_ENTRY", "SIMULATED_EXIT") else None,
+        })
 
 
 def load_ohlcv(path: Path) -> pd.DataFrame:
@@ -162,6 +202,39 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     trades = stats["_trades"]
     trades_path = reports_dir / "backtest_trades.csv"
     trades.to_csv(trades_path, index=False)
+
+    # Export crossover decisions and, where applicable, link them to the
+    # simulated fill on the following bar. This is diagnostic only.
+    signal_log = pd.DataFrame(stats["_strategy"].signal_log)
+    if not signal_log.empty:
+        signal_log["ExecutionTime"] = pd.NaT
+        signal_log["ExecutionOpen"] = np.nan
+        signal_log["MatchedTradePnL"] = np.nan
+        signal_log["MatchedTradeReturnPct"] = np.nan
+
+        for row_index, signal in signal_log.iterrows():
+            execution_bar = signal["ExecutionBar"]
+            if pd.isna(execution_bar):
+                continue
+            execution_bar = int(execution_bar)
+            if execution_bar < len(data):
+                signal_log.at[row_index, "ExecutionTime"] = data.index[execution_bar]
+                signal_log.at[row_index, "ExecutionOpen"] = float(data["Open"].iloc[execution_bar])
+
+            if signal["SignalType"] == "ENTRY" and not trades.empty:
+                matched = trades[trades["EntryBar"] == execution_bar]
+            elif signal["SignalType"] == "EXIT" and not trades.empty:
+                matched = trades[trades["ExitBar"] == execution_bar]
+            else:
+                matched = trades.iloc[0:0]
+
+            if not matched.empty:
+                trade = matched.iloc[0]
+                signal_log.at[row_index, "MatchedTradePnL"] = float(trade["PnL"])
+                signal_log.at[row_index, "MatchedTradeReturnPct"] = float(trade["ReturnPct"])
+
+    signals_path = reports_dir / "backtest_signals.csv"
+    signal_log.to_csv(signals_path, index=False)
 
     trade_metrics = calculate_trade_metrics(trades)
 
