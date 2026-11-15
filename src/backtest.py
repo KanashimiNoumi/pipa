@@ -215,6 +215,25 @@ def analyze_signal_outcomes(data: pd.DataFrame, signals: pd.DataFrame):
                 "negative": int((values < 0).sum()),
                 "flat": int((values.abs() < 1e-9).sum()),
             }
+
+        rejected = valid[valid["Decision"] == "REJECTED_RSI_FILTER"]
+        filter_helped = 0
+        filter_hurt = 0
+        for _, signal in rejected.iterrows():
+            change = float(signal[return_column])
+            if signal["SignalType"] == "ENTRY":
+                # A rejected entry looks helpful when price subsequently fell.
+                filter_helped += int(change < 0)
+                filter_hurt += int(change > 0)
+            else:
+                # A rejected exit looks helpful when holding avoided an early exit.
+                filter_helped += int(change > 0)
+                filter_hurt += int(change < 0)
+        summary[f"RSI_FILTER_{horizon}h"] = {
+            "rejected": int(len(rejected)),
+            "helped": filter_helped,
+            "hurt": filter_hurt,
+        }
     return analyzed, summary
 
 
@@ -224,15 +243,20 @@ def print_signal_analysis(summary: dict):
     for horizon in (3, 6, 12, 24):
         entry = summary.get(f"ENTRY_{horizon}h", {})
         exit_ = summary.get(f"EXIT_{horizon}h", {})
+        filter_result = summary.get(f"RSI_FILTER_{horizon}h", {})
         print(
             f"{horizon:>2}h | ENTRY: +{entry.get('positive', 0)} / "
             f"-{entry.get('negative', 0)} / ={entry.get('flat', 0)} "
             f"(n={entry.get('count', 0)}) | "
             f"EXIT: +{exit_.get('positive', 0)} / "
             f"-{exit_.get('negative', 0)} / ={exit_.get('flat', 0)} "
-            f"(n={exit_.get('count', 0)})"
+            f"(n={exit_.get('count', 0)}) | "
+            f"RSI filter: helped {filter_result.get('helped', 0)}, "
+            f"hurt {filter_result.get('hurt', 0)} "
+            f"(rejected={filter_result.get('rejected', 0)})"
         )
     print("For ENTRY, positive change is favorable; for EXIT, negative change is favorable.")
+    print("RSI filter counts are hindsight diagnostics, not proof of causation.")
 
 def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     config = json.loads(config_path.read_text(encoding="utf-8"))
