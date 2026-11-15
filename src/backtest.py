@@ -207,7 +207,9 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     # simulated fill on the following bar. This is diagnostic only.
     signal_log = pd.DataFrame(stats["_strategy"].signal_log)
     if not signal_log.empty:
-        signal_log["ExecutionTime"] = pd.NaT
+        signal_log["ExecutionTime"] = pd.Series(
+            [pd.NaT] * len(signal_log), index=signal_log.index, dtype="datetime64[ns, UTC]"
+        )
         signal_log["ExecutionOpen"] = np.nan
         signal_log["MatchedTradePnL"] = np.nan
         signal_log["MatchedTradeReturnPct"] = np.nan
@@ -258,6 +260,7 @@ def run_backtest(data_path: Path, config_path: Path, make_plot: bool = False):
     print(f"Profit Factor: {profit_factor_text}")
     print(f"Maximum consecutive losses: {trade_metrics['max_consecutive_losses']}")
     print(f"Trade report: {trades_path}")
+    print(f"Signal audit report: {signals_path}")
     print("\nSimulation only. Historical results do not predict future outcomes.")
 
     if make_plot:
