@@ -334,5 +334,5 @@ def main():
     print("\nSimulation only. Historical results are descriptive and do not predict future outcomes.")
 
 
-if __current__ == "__main__":
+if __name__ == "__main__":
     main()
