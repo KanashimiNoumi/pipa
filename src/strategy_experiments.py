@@ -6,6 +6,7 @@ connectivity and cannot place live orders.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -59,23 +60,34 @@ class ExperimentStrategy(Strategy):
         close = self.data.Close
         self.fast = self.I(ema, close, self.fast_ema, name="EMA fast")
         self.slow = self.I(ema, close, self.slow_ema, name="EMA slow")
-        self.trend = self.I(ema, close, self.trend_ema, name="EMA 200")
         self.momentum = self.I(rsi, close, self.rsi_period, name="RSI")
-        self.volatility = self.I(
-            atr_percent,
-            self.data.High,
-            self.data.Low,
-            close,
-            14,
-            name="ATR %",
-        )
-        self.volatility_ceiling = self.I(
-            atr_percent_limit,
-            self.volatility,
-            200,
-            0.90,
-            name="ATR 90th percentile",
-        )
+
+        # Register only indicators actually used by this variant. This keeps
+        # the baseline warm-up identical to the original EMA/RSI backtest.
+        self.trend = None
+        self.volatility = None
+        self.volatility_ceiling = None
+
+        if self.use_trend_filter:
+            self.trend = self.I(ema, close, self.trend_ema, name="EMA 200")
+
+        if self.use_volatility_filter:
+            self.volatility = self.I(
+                atr_percent,
+                self.data.High,
+                self.data.Low,
+                close,
+                14,
+                name="ATR %",
+            )
+            self.volatility_ceiling = self.I(
+                atr_percent_limit,
+                self.volatility,
+                200,
+                0.90,
+                name="ATR 90th percentile",
+            )
+
         self.signal_log = []
 
     def next(self):
@@ -98,6 +110,7 @@ class ExperimentStrategy(Strategy):
             else:
                 if self.use_trend_filter and self.data.Close[-1] <= self.trend[-1]:
                     reasons.append("TREND")
+
                 if self.use_volatility_filter:
                     ceiling = self.volatility_ceiling[-1]
                     current_volatility = self.volatility[-1]
@@ -124,14 +137,72 @@ class ExperimentStrategy(Strategy):
             "SignalType": "ENTRY" if crossed_up else "EXIT",
             "RSI": rsi_value,
             "Close": float(self.data.Close[-1]) * PRICE_SCALE,
-            "EMA200": float(self.trend[-1]) * PRICE_SCALE,
-            "ATR_pct": float(self.volatility[-1]),
+            "EMA200": (
+                float(self.trend[-1]) * PRICE_SCALE
+                if self.trend is not None else np.nan
+            ),
+            "ATR_pct": (
+                float(self.volatility[-1])
+                if self.volatility is not None else np.nan
+            ),
             "Decision": decision,
         })
 
 
+def build_monthly_report(stats, variant: str, starting_balance: float) -> pd.DataFrame:
+    """Build monthly mark-to-market returns and closed-trade statistics."""
+    equity_curve = stats["_equity_curve"].copy()
+    equity_curve["Month"] = equity_curve.index.strftime("%Y-%m")
+
+    month_end_equity = equity_curve.groupby("Month")["Equity"].last()
+    monthly_drawdown = equity_curve.groupby("Month")["DrawdownPct"].min() * 100
+
+    trades = stats["_trades"].copy()
+    if not trades.empty:
+        trades["Month"] = pd.to_datetime(trades["ExitTime"]).dt.strftime("%Y-%m")
+    rows = []
+    previous_month_equity = float(starting_balance)
+
+    for month, ending_equity in month_end_equity.items():
+        month_trades = trades[trades["Month"] == month] if not trades.empty else trades
+        trade_count = len(month_trades)
+
+        if trade_count:
+            pnl = month_trades["PnL"].astype(float)
+            wins = pnl[pnl > 0]
+            losses = pnl[pnl < 0]
+            win_rate = float((pnl > 0).mean() * 100)
+            profit_factor = (
+                float(wins.sum() / abs(losses.sum()))
+                if len(losses) else (float("inf") if len(wins) else np.nan)
+            )
+        else:
+            win_rate = np.nan
+            profit_factor = np.nan
+
+        ending_equity = float(ending_equity)
+        monthly_return = (
+            (ending_equity / previous_month_equity - 1) * 100
+            if previous_month_equity else np.nan
+        )
+
+        rows.append({
+            "Variant": variant,
+            "Month": month,
+            "ReturnPct": monthly_return,
+            "EndingEquity": ending_equity,
+            "MaxDrawdownPct": float(monthly_drawdown.loc[month]),
+            "Trades": trade_count,
+            "WinRatePct": win_rate,
+            "ProfitFactor": profit_factor,
+        })
+        previous_month_equity = ending_equity
+
+    return pd.DataFrame(rows)
+
+
 def run_variant(data: pd.DataFrame, config: dict, name: str,
-                use_trend: bool, use_volatility: bool) -> dict:
+                use_trend: bool, use_volatility: bool):
     engine_data = data.copy()
     engine_data[["Open", "High", "Low", "Close"]] /= PRICE_SCALE
 
@@ -150,10 +221,11 @@ def run_variant(data: pd.DataFrame, config: dict, name: str,
         },
     )
 
+    starting_balance = float(config["starting_balance"])
     engine = Backtest(
         engine_data,
         strategy_type,
-        cash=float(config["starting_balance"]),
+        cash=starting_balance,
         commission=float(config["fee_rate"]),
         exclusive_orders=True,
     )
@@ -164,6 +236,7 @@ def run_variant(data: pd.DataFrame, config: dict, name: str,
     reports_dir = BASE / "reports"
     reports_dir.mkdir(exist_ok=True)
     safe_name = name.lower()
+
     trade_path = reports_dir / f"experiment_{safe_name}_trades.csv"
     trade_report = trades.copy()
     for column in ("EntryPrice", "ExitPrice", "SL", "TP"):
@@ -176,7 +249,9 @@ def run_variant(data: pd.DataFrame, config: dict, name: str,
     signal_path = reports_dir / f"experiment_{safe_name}_signals.csv"
     pd.DataFrame(stats["_strategy"].signal_log).to_csv(signal_path, index=False)
 
-    return {
+    monthly = build_monthly_report(stats, name, starting_balance)
+
+    summary = {
         "Variant": name,
         "ReturnPct": float(stats["Return [%]"]),
         "BuyHoldReturnPct": float(stats["Buy & Hold Return [%]"]),
@@ -191,6 +266,7 @@ def run_variant(data: pd.DataFrame, config: dict, name: str,
         "TradeReport": str(trade_path),
         "SignalReport": str(signal_path),
     }
+    return summary, monthly
 
 
 def main():
@@ -205,7 +281,6 @@ def main():
     )
     args = parser.parse_args()
 
-    import json
     config = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
     data = load_ohlcv(args.data)
 
@@ -216,6 +291,7 @@ def main():
     ]
 
     results = []
+    monthly_results = []
     print("\n=== MARKET LAB: OFFLINE STRATEGY EXPERIMENTS ===")
     print(f"Dataset: {args.data}")
     print(f"Bars: {len(data)}")
@@ -223,11 +299,20 @@ def main():
 
     for name, use_trend, use_volatility in variants:
         print(f"\nRunning {name}...")
-        results.append(run_variant(data, config, name, use_trend, use_volatility))
+        summary, monthly = run_variant(data, config, name, use_trend, use_volatility)
+        results.append(summary)
+        monthly_results.append(monthly)
+
+    reports_dir = BASE / "reports"
+    reports_dir.mkdir(exist_ok=True)
 
     summary = pd.DataFrame(results)
-    summary_path = BASE / "reports" / "strategy_experiments_summary.csv"
+    summary_path = reports_dir / "strategy_experiments_summary.csv"
     summary.to_csv(summary_path, index=False)
+
+    monthly_summary = pd.concat(monthly_results, ignore_index=True)
+    monthly_path = reports_dir / "strategy_experiments_monthly.csv"
+    monthly_summary.to_csv(monthly_path, index=False)
 
     display_columns = [
         "Variant", "ReturnPct", "MaxDrawdownPct", "Trades",
@@ -235,9 +320,19 @@ def main():
     ]
     print("\n=== COMPARISON ===")
     print(summary[display_columns].to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+    monthly_columns = [
+        "Variant", "Month", "ReturnPct", "MaxDrawdownPct",
+        "Trades", "WinRatePct", "ProfitFactor",
+    ]
+    print("\n=== MONTHLY COMPARISON ===")
+    print(monthly_summary[monthly_columns].to_string(
+        index=False, float_format=lambda x: f"{x:.2f}"
+    ))
     print(f"\nSummary report: {summary_path}")
+    print(f"Monthly report: {monthly_path}")
     print("\nSimulation only. Historical results are descriptive and do not predict future outcomes.")
 
 
-if __name__ == "__main__":
+if __current__ == "__main__":
     main()
